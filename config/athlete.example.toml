@@ -1,0 +1,51 @@
+# Athlete profile — example/template (committed).
+#
+# Copy this file to config/athlete.toml and replace the values with your own.
+# config/athlete.toml is gitignored so your personal data stays local.
+# If athlete.toml is absent, the CLI falls back to these example values.
+
+[profile]
+hr_max = 190                  # bpm — your maximum heart rate
+hr_threshold = 170            # bpm — your lactate/functional threshold HR
+hr_rest = 50                  # bpm — your resting HR
+threshold_pace_s_per_km = 270 # threshold pace in seconds per km (e.g. 270 = 4:30/km)
+
+# 5-zone HR model. Adjust the bounds to your own zones.
+[[hr_zones]]
+zone = "Z1"
+name = "Recovery"
+min = 0
+max = 137
+
+[[hr_zones]]
+zone = "Z2"
+name = "Endurance"
+min = 137
+max = 156
+
+[[hr_zones]]
+zone = "Z3"
+name = "Tempo"
+min = 156
+max = 165
+
+[[hr_zones]]
+zone = "Z4"
+name = "Threshold"
+min = 165
+max = 175
+
+[[hr_zones]]
+zone = "Z5"
+name = "VO2max"
+min = 175
+max = 999
+
+[race]
+name = "My Goal Race"
+date = "2026-06-20"           # YYYY-MM-DD
+distance_km = 50
+ascent_m = 3000
+
+[coros]
+trail_run_sport_type = 102    # Coros sportType id for trail running

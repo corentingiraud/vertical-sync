@@ -1,0 +1,34 @@
+[project]
+name = "vertical-sync"
+version = "0.1.0"
+description = "Fetch and analyze Coros training data to prepare a trail running plan"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Corentin Giraud" }]
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.1",
+    "coros-data-extractor",
+    "fitdecode>=0.11.0",
+    "pandas>=3.0.2",
+    "python-dotenv>=1.2.2",
+]
+
+[project.scripts]
+vs = "vertical_sync.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vertical_sync"]
+
+[tool.uv.sources]
+coros-data-extractor = { git = "https://github.com/gandroz/coros_data_extractor.git" }
+
+[dependency-groups]
+dev = [
+    "weasyprint>=68.1",
+]
