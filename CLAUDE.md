@@ -27,6 +27,7 @@ All analysis commands support `--json` for structured AI-readable output.
 | `vs list [--json]` | List available FIT files |
 | `vs analyze <date> [--json]` | Analyze a single activity (date YYYYMMDD or file path) |
 | `vs profile <date> [--json]` | Pace + HR profile by gradient bucket for one activity |
+| `vs fitness-test <date> [--json]` | Estimate LTHR, threshold pace, HR zones, VO2max from a field-test FIT (open formulas: Friel 20-min TT + Uth-Sørensen; independent of Coros) |
 | `vs week --start X --end Y [--json]` | Weekly analysis with summary + plan comparison |
 | `vs assess [--start X --end Y] [--json]` | Strengths/weaknesses assessment |
 | `vs plan [--week N] [--json]` | Training plan targets (read from `coach/plan/*.md`) |

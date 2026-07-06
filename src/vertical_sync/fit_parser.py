@@ -227,6 +227,86 @@ def compute_gradient_profile(enriched_df: pd.DataFrame) -> list[dict]:
     return profile
 
 
+# ---------------------------------------------------------------------------
+# Fitness-test estimators — transparent, open-formula alternative to Coros's
+# proprietary numbers. Every input comes from the athlete's own FIT + config;
+# nothing is read back from Coros. Cross-check the watch, don't copy it.
+# ---------------------------------------------------------------------------
+
+# Friel running HR zones as fractions of LTHR, collapsed to 5 zones
+# (his 5a/5b/5c anaerobic split is irrelevant for ultra trail).
+FRIEL_LTHR_PCT = [0.85, 0.90, 0.95, 1.03]
+
+
+def estimate_threshold(records_df: pd.DataFrame, window_s: int = 1200) -> dict | None:
+    """LTHR + threshold pace from the hardest continuous `window_s` window.
+
+    Field-test method (Friel/Coggan 20-min TT): threshold HR is the mean HR of
+    a maximal ~20-min sustained effort, and threshold pace is the grade-adjusted
+    pace (GAP) over that same window — so it stays valid on rolling terrain,
+    unlike Coros's flat-only test. Taking the highest-mean-HR window makes it
+    robust to where the warm-up / cool-down sit in the file. Returns None if
+    there is no HR or the file is shorter than the window.
+    """
+    if "heart_rate" not in records_df.columns or "timestamp" not in records_df.columns:
+        return None
+    df = enrich_records(records_df)
+    if "timestamp_dt" not in df.columns:
+        df = df.assign(timestamp_dt=pd.to_datetime(df["timestamp"]))
+    df = df.dropna(subset=["heart_rate"]).set_index("timestamp_dt").sort_index()
+    if df.empty or (df.index[-1] - df.index[0]).total_seconds() < window_s:
+        return None
+
+    hr_roll = df["heart_rate"].rolling(f"{window_s}s").mean()
+    end = hr_roll.idxmax()
+    lthr = round(float(hr_roll.loc[end]))
+
+    thr_pace_s = None
+    win = df.loc[end - pd.Timedelta(seconds=window_s):end]
+    if "gap_speed" in win.columns:
+        gap = win.loc[win["enhanced_speed"] > 0.5, "gap_speed"].dropna()
+        if len(gap) and gap.mean() > 0:
+            thr_pace_s = round(1000 / gap.mean())
+
+    return {"lthr": lthr, "threshold_pace_s_per_km": thr_pace_s, "window_min": window_s // 60}
+
+
+def estimate_vo2max(hr_max: float | None, hr_rest: float | None) -> float | None:
+    """VO2max estimate, Uth-Sorensen (2004): 15.3 * HRmax / HRrest (ml/kg/min)."""
+    if not hr_max or not hr_rest:
+        return None
+    return round(15.3 * hr_max / hr_rest, 1)
+
+
+def zones_from_lthr(lthr: int) -> list[dict]:
+    """5 HR zones derived from LTHR via Friel's running-zone percentages."""
+    b = [round(lthr * p) for p in FRIEL_LTHR_PCT]
+    names = ["Recovery", "Aerobic", "Tempo", "Threshold", "Anaerobic"]
+    bounds = [0, *b, 999]
+    return [
+        {"zone": f"Z{i + 1}", "name": names[i], "min": bounds[i], "max": bounds[i + 1]}
+        for i in range(5)
+    ]
+
+
+def analyze_fitness_test(fit_data: dict, filename: str, hr_rest: float | None = None) -> dict:
+    """Estimate threshold, HR zones and VO2max from a field-test FIT (open formulas)."""
+    records_df = pd.DataFrame(fit_data["records"])
+    hr = records_df["heart_rate"].dropna() if "heart_rate" in records_df.columns else pd.Series(dtype=float)
+    max_hr = int(hr.max()) if len(hr) else None
+    result = {
+        "filename": filename,
+        "max_hr": max_hr,
+        "hr_rest": hr_rest,
+        "vo2max": estimate_vo2max(max_hr, hr_rest),
+    }
+    thr = estimate_threshold(records_df)
+    if thr:
+        result.update(thr)
+        result["zones"] = zones_from_lthr(thr["lthr"])
+    return result
+
+
 def analyze_activity(fit_data: dict, filename: str) -> dict | None:
     """Analyze a single activity and return structured metrics."""
     if not fit_data["sessions"]:
@@ -352,3 +432,23 @@ def compute_week_summary(activities: list[dict]) -> dict:
         "vertical_ratio": round(total_dplus / total_km) if total_km > 0 else 0,
         "km_effort": round(total_km + total_dplus / 100, 1),
     }
+
+
+if __name__ == "__main__":
+    # self-check for the open-formula estimators
+    assert estimate_vo2max(187, 47) == 60.9, estimate_vo2max(187, 47)
+    z = zones_from_lthr(175)
+    assert [x["max"] for x in z[:4]] == [149, 158, 166, 180], z
+    assert z[0]["min"] == 0 and z[-1]["max"] == 999, z
+    # synthetic 25-min ramp on flat terrain: LTHR = last-20-min mean, pace = 3 m/s
+    n = 25 * 60
+    _df = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=n, freq="s"),
+        "heart_rate": np.linspace(150, 180, n),
+        "enhanced_altitude": np.zeros(n),
+        "enhanced_speed": np.full(n, 3.0),
+    })
+    thr = estimate_threshold(_df)
+    assert thr and 165 <= thr["lthr"] <= 178, thr
+    assert thr["threshold_pace_s_per_km"] == round(1000 / 3.0), thr
+    print("fit_parser self-check OK:", estimate_vo2max(187, 47), thr)

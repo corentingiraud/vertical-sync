@@ -6,9 +6,10 @@ from pathlib import Path
 
 import click
 
-from .config import COROS_TRAIL_RUN, FIT_DIR, PLAN_WEEKS, RACE, get_plan_week
+from .config import COROS_TRAIL_RUN, FIT_DIR, HR_REST, PLAN_WEEKS, RACE, get_plan_week
 from .fit_parser import (
     analyze_activity,
+    analyze_fitness_test,
     compute_gradient_profile,
     compute_week_summary,
     enrich_records,
@@ -280,6 +281,57 @@ def analyze(target, as_json):
         if assessment:
             click.echo("")
             _print_assessment(assessment)
+
+
+# ---------------------------------------------------------------------------
+# fitness-test
+# ---------------------------------------------------------------------------
+
+def _print_fitness_test(r: dict) -> None:
+    click.echo(f"Fitness test — {r['filename']}")
+    click.echo("  (open-formula estimate, independent of Coros)\n")
+    click.echo(f"  Threshold HR (LTHR)   {r['lthr']} bpm   [{r['window_min']}-min TT method]")
+    if r.get("threshold_pace_s_per_km"):
+        p = r["threshold_pace_s_per_km"]
+        click.echo(f"  Threshold pace (GAP)  {p // 60}:{p % 60:02d} /km")
+    click.echo(f"  Max HR (this file)    {r.get('max_hr')} bpm")
+    if r.get("vo2max"):
+        click.echo(f"  VO2max                {r['vo2max']} ml/kg/min   [Uth-Sorensen]")
+    click.echo("\n  HR zones (Friel, from LTHR):")
+    for z in r.get("zones", []):
+        rng = f"≥ {z['min']}" if z["max"] >= 999 else f"{z['min']}–{z['max'] - 1}"
+        click.echo(f"    {z['zone']}  {z['name']:<10} {rng} bpm")
+
+
+@cli.command("fitness-test")
+@click.argument("target")
+@click.option("--json", "as_json", is_flag=True, help="JSON output")
+def fitness_test(target, as_json):
+    """Estimate threshold, HR zones and VO2max from a field-test FIT.
+
+    Open, transparent formulas (Friel 20-min TT + Uth-Sorensen) — an
+    independent alternative to Coros's proprietary numbers. TARGET is a date
+    (YYYYMMDD / YYYY-MM-DD) or a file path; use a maximal ~20-30 min sustained
+    effort.
+    """
+    path = Path(target)
+    if not path.exists():
+        date_int = parse_date(target)
+        files = find_fit_files(start=date_int, end=date_int)
+        if not files:
+            click.echo(f"No FIT file found for {target}", err=True)
+            sys.exit(1)
+        path = files[0]
+
+    result = analyze_fitness_test(parse_fit(path), path.name, HR_REST)
+    if "lthr" not in result:
+        click.echo("Could not estimate threshold (need HR data and a ~20+ min effort).", err=True)
+        sys.exit(1)
+
+    if as_json:
+        click.echo(json.dumps(result, default=str, indent=2))
+    else:
+        _print_fitness_test(result)
 
 
 # ---------------------------------------------------------------------------
