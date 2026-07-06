@@ -61,9 +61,36 @@ def cli():
 # login
 # ---------------------------------------------------------------------------
 
+GARMIN_TOKENSTORE = "~/.garminconnect"
+
+
+def _garmin_client():
+    """Login to Garmin Connect, reusing cached tokens when available."""
+    import os
+
+    from dotenv import load_dotenv
+    from garminconnect import Garmin
+
+    load_dotenv()
+    client = Garmin(
+        email=os.environ["GARMIN_EMAIL"],
+        password=os.environ["GARMIN_PASSWORD"],
+        prompt_mfa=lambda: click.prompt("Garmin MFA code"),
+    )
+    client.login(GARMIN_TOKENSTORE)
+    return client
+
+
 @cli.command()
-def login():
-    """Test Coros Training Hub login."""
+@click.option("--source", type=click.Choice(["coros", "garmin"]), default="coros",
+              show_default=True, help="Data source")
+def login(source):
+    """Test the data source login (Coros Training Hub or Garmin Connect)."""
+    if source == "garmin":
+        client = _garmin_client()
+        click.echo(f"Login successful! Garmin user: {client.get_full_name()}")
+        return
+
     import os
 
     from dotenv import load_dotenv
@@ -79,12 +106,8 @@ def login():
 # download
 # ---------------------------------------------------------------------------
 
-@cli.command()
-@click.option("--start", required=True, help="Start date (YYYYMMDD or YYYY-MM-DD)")
-@click.option("--end", required=True, help="End date (YYYYMMDD or YYYY-MM-DD)")
-@click.option("--json", "as_json", is_flag=True, help="JSON output")
-def download(start, end, as_json):
-    """Download trail run FIT files from Coros for a date range."""
+def _download_coros(start_d: int, end_d: int, as_json: bool) -> list[str]:
+    """Download trail run FITs from Coros Training Hub. Returns filenames."""
     import os
 
     import requests
@@ -94,8 +117,6 @@ def download(start, end, as_json):
     from coros_data_extractor.data.constants import ACTIVITY_DOWNLOAD_URL
 
     load_dotenv()
-    start_d, end_d = parse_date(start), parse_date(end)
-
     ext = CorosDataExtractor()
     ext.login(os.environ["COROS_EMAIL"], os.environ["COROS_PASSWORD"])
 
@@ -106,7 +127,6 @@ def download(start, end, as_json):
         if start_d <= a["date"] <= end_d and a["sportType"] == COROS_TRAIL_RUN
     ]
 
-    FIT_DIR.mkdir(parents=True, exist_ok=True)
     headers = {"Accesstoken": ext.access_token}
     downloaded = []
 
@@ -131,6 +151,65 @@ def download(start, end, as_json):
         downloaded.append(filename)
         if not as_json:
             click.echo(f"[OK] {filename}")
+
+    return downloaded
+
+
+def _download_garmin(start_d: int, end_d: int, as_json: bool) -> list[str]:
+    """Download trail run FITs from Garmin Connect. Returns filenames."""
+    import io
+    import zipfile
+
+    from garminconnect import Garmin
+
+    client = _garmin_client()
+    to_iso = lambda d: f"{d // 10000:04d}-{d % 10000 // 100:02d}-{d % 100:02d}"
+    activities = client.get_activities_by_date(
+        to_iso(start_d), to_iso(end_d), activitytype="running"
+    )
+    trail_runs = [
+        a for a in activities
+        if a.get("activityType", {}).get("typeKey") == "trail_running"
+    ]
+
+    downloaded = []
+    for a in trail_runs:
+        # ORIGINAL format is a zip wrapping the on-watch .fit file
+        raw = client.download_activity(
+            str(a["activityId"]), dl_fmt=Garmin.ActivityDownloadFormat.ORIGINAL
+        )
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            fit_members = [n for n in zf.namelist() if n.lower().endswith(".fit")]
+            if not fit_members:
+                if not as_json:
+                    click.echo(f"[SKIP] No FIT for {a.get('activityName')}", err=True)
+                continue
+            content = zf.read(fit_members[0])
+
+        date = a["startTimeLocal"][:10].replace("-", "")
+        name = (a.get("activityName") or "activity").replace(" ", "_").replace("/", "-")
+        filename = f"{date}_{name}_{a['activityId']}.fit"
+        (FIT_DIR / filename).write_bytes(content)
+        downloaded.append(filename)
+        if not as_json:
+            click.echo(f"[OK] {filename}")
+
+    return downloaded
+
+
+@cli.command()
+@click.option("--start", required=True, help="Start date (YYYYMMDD or YYYY-MM-DD)")
+@click.option("--end", required=True, help="End date (YYYYMMDD or YYYY-MM-DD)")
+@click.option("--source", type=click.Choice(["coros", "garmin"]), default="coros",
+              show_default=True, help="Data source")
+@click.option("--json", "as_json", is_flag=True, help="JSON output")
+def download(start, end, source, as_json):
+    """Download trail run FIT files for a date range (Coros or Garmin)."""
+    start_d, end_d = parse_date(start), parse_date(end)
+    FIT_DIR.mkdir(parents=True, exist_ok=True)
+
+    fetch = _download_garmin if source == "garmin" else _download_coros
+    downloaded = fetch(start_d, end_d, as_json)
 
     if as_json:
         click.echo(json.dumps({"downloaded": downloaded, "count": len(downloaded)}))
