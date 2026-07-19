@@ -14,6 +14,7 @@ from .fit_parser import (
     compute_week_summary,
     enrich_records,
     find_fit_files,
+    find_sustained_efforts,
     format_duration,
     parse_fit,
 )
@@ -23,6 +24,43 @@ from .analysis import assess_activity, assess_week
 def parse_date(value: str) -> int:
     """Accept YYYYMMDD or YYYY-MM-DD, return int YYYYMMDD."""
     return int(value.replace("-", ""))
+
+
+def parse_elapsed(value: str) -> int:
+    """Elapsed time 'MM:SS' or 'H:MM:SS' → seconds."""
+    parts = value.split(":")
+    if len(parts) not in (2, 3) or not all(p.isdigit() for p in parts):
+        raise click.BadParameter(f"expected MM:SS or H:MM:SS, got {value!r}")
+    nums = [int(p) for p in parts]
+    if len(nums) == 2:
+        return nums[0] * 60 + nums[1]
+    return nums[0] * 3600 + nums[1] * 60 + nums[2]
+
+
+def format_elapsed(seconds: float) -> str:
+    """Seconds → 'M:SS' elapsed label (minutes not capped at 60)."""
+    m, s = divmod(round(seconds), 60)
+    return f"{m}:{s:02d}"
+
+
+def _fmt_pace_s(pace_s: int | None) -> str:
+    """Seconds-per-km → 'M:SS' pace label."""
+    if not pace_s:
+        return "N/A"
+    return f"{pace_s // 60}:{pace_s % 60:02d}"
+
+
+def _resolve_fit(target: str) -> Path:
+    """Resolve a CLI target (date YYYYMMDD / YYYY-MM-DD, or file path) to a FIT path."""
+    path = Path(target)
+    if path.exists():
+        return path
+    date_int = parse_date(target)
+    files = find_fit_files(start=date_int, end=date_int)
+    if not files:
+        click.echo(f"No FIT file found for {target}", err=True)
+        sys.exit(1)
+    return files[0]
 
 
 def _race_label() -> str:
@@ -256,15 +294,7 @@ def analyze(target, as_json):
 
     TARGET can be a date (YYYYMMDD or YYYY-MM-DD) or a file path.
     """
-    path = Path(target)
-    if not path.exists():
-        date_int = parse_date(target)
-        files = find_fit_files(start=date_int, end=date_int)
-        if not files:
-            click.echo(f"No FIT file found for {target}", err=True)
-            sys.exit(1)
-        path = files[0]
-
+    path = _resolve_fit(target)
     fit_data = parse_fit(path)
     metrics = analyze_activity(fit_data, path.name)
 
@@ -290,13 +320,23 @@ def analyze(target, as_json):
 def _print_fitness_test(r: dict) -> None:
     click.echo(f"Fitness test — {r['filename']}")
     click.echo("  (open-formula estimate, independent of Coros)\n")
+    if r.get("window_start_s") is not None:
+        net = r.get("window_net_elevation_m")
+        net_str = f", net {net:+d} m" if net is not None else ""
+        click.echo(
+            f"  Window                {format_elapsed(r['window_start_s'])} → "
+            f"{format_elapsed(r['window_end_s'])} elapsed{net_str}"
+        )
     click.echo(f"  Threshold HR (LTHR)   {r['lthr']} bpm   [{r['window_min']}-min TT method]")
-    if r.get("threshold_pace_s_per_km"):
-        p = r["threshold_pace_s_per_km"]
-        click.echo(f"  Threshold pace (GAP)  {p // 60}:{p % 60:02d} /km")
+    if r.get("threshold_pace_gap_s_per_km"):
+        click.echo(f"  Threshold pace (GAP)  {_fmt_pace_s(r['threshold_pace_gap_s_per_km'])} /km")
+    if r.get("threshold_pace_raw_s_per_km"):
+        click.echo(f"  Threshold pace (raw)  {_fmt_pace_s(r['threshold_pace_raw_s_per_km'])} /km")
     click.echo(f"  Max HR (this file)    {r.get('max_hr')} bpm")
     if r.get("vo2max"):
         click.echo(f"  VO2max                {r['vo2max']} ml/kg/min   [Uth-Sorensen]")
+    for w in r.get("warnings", []):
+        click.echo(click.style(f"\n  ! {w}", fg="yellow"))
     click.echo("\n  HR zones (Friel, from LTHR):")
     for z in r.get("zones", []):
         rng = f"≥ {z['min']}" if z["max"] >= 999 else f"{z['min']}–{z['max'] - 1}"
@@ -305,25 +345,26 @@ def _print_fitness_test(r: dict) -> None:
 
 @cli.command("fitness-test")
 @click.argument("target")
+@click.option("--from", "from_", default=None, metavar="MM:SS",
+              help="Window start (elapsed MM:SS or H:MM:SS); overrides the auto window")
+@click.option("--to", "to_", default=None, metavar="MM:SS",
+              help="Window end (elapsed MM:SS or H:MM:SS)")
 @click.option("--json", "as_json", is_flag=True, help="JSON output")
-def fitness_test(target, as_json):
+def fitness_test(target, from_, to_, as_json):
     """Estimate threshold, HR zones and VO2max from a field-test FIT.
 
     Open, transparent formulas (Friel 20-min TT + Uth-Sorensen) — an
     independent alternative to Coros's proprietary numbers. TARGET is a date
     (YYYYMMDD / YYYY-MM-DD) or a file path; use a maximal ~20-30 min sustained
-    effort.
+    effort. By default the best 20-min window is auto-picked; pass --from/--to
+    when you know where the effort sits in the file.
     """
-    path = Path(target)
-    if not path.exists():
-        date_int = parse_date(target)
-        files = find_fit_files(start=date_int, end=date_int)
-        if not files:
-            click.echo(f"No FIT file found for {target}", err=True)
-            sys.exit(1)
-        path = files[0]
+    if (from_ is None) != (to_ is None):
+        raise click.UsageError("--from and --to must be given together")
+    window = (parse_elapsed(from_), parse_elapsed(to_)) if from_ else None
 
-    result = analyze_fitness_test(parse_fit(path), path.name, HR_REST)
+    path = _resolve_fit(target)
+    result = analyze_fitness_test(parse_fit(path), path.name, HR_REST, window=window)
     if "lthr" not in result:
         click.echo("Could not estimate threshold (need HR data and a ~20+ min effort).", err=True)
         sys.exit(1)
@@ -465,15 +506,7 @@ def profile(target, as_json):
     """
     import pandas as pd
 
-    path = Path(target)
-    if not path.exists():
-        date_int = parse_date(target)
-        files = find_fit_files(start=date_int, end=date_int)
-        if not files:
-            click.echo(f"No FIT file found for {target}", err=True)
-            sys.exit(1)
-        path = files[0]
-
+    path = _resolve_fit(target)
     fit_data = parse_fit(path)
     records_df = pd.DataFrame(fit_data["records"])
     enriched = enrich_records(records_df)
@@ -503,6 +536,57 @@ def profile(target, as_json):
                 f"{b['avg_gap']:>7}/km {hr_str:>5} "
                 f"{b['time']:>8} {b['distance_m']:>6}m"
             )
+
+
+# ---------------------------------------------------------------------------
+# effort (sustained-effort extractor)
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("target")
+@click.option("--window", "windows", multiple=True, type=int, default=(20,), show_default=True,
+              help="Window length in minutes (repeatable: --window 20 --window 30)")
+@click.option("--json", "as_json", is_flag=True, help="JSON output")
+def effort(target, windows, as_json):
+    """Find the best sustained steady efforts inside an activity.
+
+    Run this on race/outing files to recalibrate hr_threshold and
+    threshold_pace_s_per_km in config/athlete.toml without a field test.
+    TARGET is a date (YYYYMMDD / YYYY-MM-DD) or a file path. Shows the top 3
+    non-overlapping candidates per window length, ranked by average HR.
+    """
+    import pandas as pd
+
+    path = _resolve_fit(target)
+    records_df = pd.DataFrame(parse_fit(path)["records"])
+    efforts = find_sustained_efforts(records_df, tuple(windows))
+
+    if not efforts:
+        click.echo("No sustained effort found (need HR data longer than the window).", err=True)
+        sys.exit(1)
+
+    if as_json:
+        click.echo(json.dumps({"filename": path.name, "efforts": efforts}, indent=2))
+        return
+
+    click.echo(f"\n  EFFORTS SOUTENUS — {path.name}")
+    click.echo(f"  {'─' * 74}")
+    click.echo(
+        f"  {'Fenetre':<8} {'Debut → Fin':<16} {'FC':>4} {'Allure':>8} {'GAP':>8} "
+        f"{'D net':>6} {'ΔFC':>6} {'Steady':>7}"
+    )
+    click.echo(f"  {'─' * 74}")
+    for ef in efforts:
+        rng = f"{format_elapsed(ef['window_start_s'])} → {format_elapsed(ef['window_end_s'])}"
+        net = f"{ef['net_elevation_m']:+d}m" if ef["net_elevation_m"] is not None else "—"
+        slope = f"{ef['hr_slope_bpm']:+.1f}" if ef["hr_slope_bpm"] is not None else "—"
+        click.echo(
+            f"  {ef['window_min']:>4}min  {rng:<16} {ef['avg_hr'] or '—':>4} "
+            f"{_fmt_pace_s(ef['pace_raw_s_per_km']):>5}/km {_fmt_pace_s(ef['pace_gap_s_per_km']):>5}/km "
+            f"{net:>6} {slope:>6} {'oui' if ef['steady'] else 'NON':>7}"
+        )
+    click.echo("\n  Steady = pente FC < 5 bpm, amplitude FC < 15 bpm, pas de pause > 30s, mouvement continu.")
+    click.echo("  Utiliser les fenetres steady pour recalibrer hr_threshold / threshold_pace.")
 
 
 # ---------------------------------------------------------------------------
@@ -624,22 +708,35 @@ def _print_activity(m: dict):
     click.echo(f"  {m['filename']}")
     click.echo(f"  {m['date']}")
     click.echo(f"{'=' * 60}")
+    if m.get("sport") and m["sport"] != "running":
+        click.echo(f"  Sport:         {m['sport']} ({m.get('sub_sport') or '?'})")
     click.echo(f"  Distance:      {m['distance_km']:.1f} km")
     click.echo(f"  Duree:         {m['duration']}")
     click.echo(f"  D+:            {m['ascent_m']} m")
     click.echo(f"  D-:            {m['descent_m']} m")
-    click.echo(f"  Allure moy:    {m['avg_pace']} /km")
+    if m.get("avg_pace"):
+        click.echo(f"  Allure moy:    {m['avg_pace']} /km")
     if m.get("avg_gap") and m["avg_gap"] != "N/A":
         click.echo(f"  GAP:           {m['avg_gap']} /km")
     click.echo(f"  FC moy:        {m['avg_hr']} bpm")
-    click.echo(f"  FC max:        {m['max_hr']} bpm")
-    click.echo(f"  Cadence:       {m['avg_cadence']} spm")
+    suspect = ""
+    if m.get("max_hr_suspect"):
+        suspect = click.style(f"  (suspect — pic capteur, max nettoye {m['max_hr_clean']})", fg="yellow")
+    click.echo(f"  FC max:        {m['max_hr']} bpm{suspect}")
+    if m.get("avg_cadence"):
+        click.echo(f"  Cadence:       {m['avg_cadence']} spm")
+    if m.get("cadence_flat"):
+        click.echo(f"  Cadence plat:  {m['cadence_flat']} spm (|pente| < 5%)")
     click.echo(f"  D+ horaire:    {m['ascent_rate_m_h']} m/h")
-    click.echo(f"  Km-effort:     {m['km_effort']}")
+    if m.get("km_effort") is not None:
+        click.echo(f"  Km-effort:     {m['km_effort']}")
     if m.get("elevation"):
         click.echo(f"  Altitude:      {m['elevation']['min']}m — {m['elevation']['max']}m")
     if m.get("cardiac_drift_pct") is not None:
-        click.echo(f"  Derive card.:  {m['cardiac_drift_pct']:+.1f}%")
+        conf = ""
+        if m.get("cardiac_drift_confounded"):
+            conf = click.style(f"  (non interpretable: {m['cardiac_drift_note']})", fg="yellow")
+        click.echo(f"  Derive card.:  {m['cardiac_drift_pct']:+.1f}%{conf}")
     if m.get("hr_zones"):
         click.echo("  Zones FC:")
         for z, info in m["hr_zones"].items():
@@ -666,6 +763,13 @@ def _print_week_summary(summary: dict, start_date: int):
         click.echo(f"  Semaine {plan_w['week']} — {plan_w['phase']}")
     click.echo(f"{'━' * 60}")
     click.echo(f"  Seances:       {summary['runs']}")
+    by_sport = summary.get("by_sport", {})
+    if len(by_sport) > 1:
+        for sport, g in by_sport.items():
+            click.echo(
+                f"    {sport:<6} {g['sessions']} seance(s), {g['total_km']:.1f} km, "
+                f"{g['total_dplus']} m D+, {g['total_time_h']:.1f}h"
+            )
     click.echo(f"  Distance:      {summary['total_km']:.1f} km")
     click.echo(f"  D+:            {summary['total_dplus']} m")
     click.echo(f"  Temps total:   {summary['total_time']} ({summary['total_time_h']:.1f}h)")

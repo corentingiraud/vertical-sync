@@ -6,7 +6,7 @@ import fitdecode
 import numpy as np
 import pandas as pd
 
-from .config import FIT_DIR, HR_ZONES
+from .config import FIT_DIR, HR_MAX, HR_ZONES
 
 
 # ---------------------------------------------------------------------------
@@ -123,19 +123,49 @@ def compute_uphill_time(records_df: pd.DataFrame) -> float | None:
     return uphill_s if uphill_s > 0 else None
 
 
-def compute_cardiac_drift(records_df: pd.DataFrame) -> float | None:
-    """Cardiac drift: % HR increase from first half to second half."""
+def compute_cardiac_drift(records_df: pd.DataFrame) -> dict | None:
+    """Cardiac drift: % HR increase from first half to second half.
+
+    Pass an enriched DataFrame (see enrich_records) to also compare the
+    terrain profile of the two halves (avg gradient, climb-time share): when
+    they differ, the number reflects the course profile, not fatigue — it is
+    flagged ``confounded`` with a reason, never hidden.
+    """
     if "heart_rate" not in records_df.columns:
         return None
-    hr = records_df["heart_rate"].dropna()
-    if len(hr) < 60:
+    df = records_df.dropna(subset=["heart_rate"])
+    if len(df) < 60:
         return None
-    mid = len(hr) // 2
-    first_avg = hr.iloc[:mid].mean()
-    second_avg = hr.iloc[mid:].mean()
+    mid = len(df) // 2
+    halves = df.iloc[:mid], df.iloc[mid:]
+    first_avg = halves[0]["heart_rate"].mean()
+    second_avg = halves[1]["heart_rate"].mean()
     if first_avg == 0:
         return None
-    return round((second_avg - first_avg) / first_avg * 100, 1)
+    result = {
+        "pct": round((second_avg - first_avg) / first_avg * 100, 1),
+        "confounded": False,
+        "note": None,
+    }
+
+    if {"gradient", "dt", "alt_delta", "dist_delta"}.issubset(df.columns):
+        grads, climbs = [], []
+        for h in halves:
+            dist = h["dist_delta"].sum()
+            time = h["dt"].sum()
+            grads.append(h["alt_delta"].sum() / dist if dist > 0 else 0.0)
+            climbs.append(h.loc[h["gradient"] > 0.03, "dt"].sum() / time if time > 0 else 0.0)
+        # A drift too small to interpret (< 3%) needs no terrain excuse; only
+        # flag when the profile asymmetry could explain the observed number
+        asymmetric = abs(grads[0] - grads[1]) > 0.03 or abs(climbs[0] - climbs[1]) > 0.20
+        if asymmetric and abs(result["pct"]) >= 3:
+            result["confounded"] = True
+            result["note"] = (
+                f"profil asymetrique entre les deux moities "
+                f"(pente moy {grads[0] * 100:+.1f}% vs {grads[1] * 100:+.1f}%, "
+                f"temps en montee {climbs[0] * 100:.0f}% vs {climbs[1] * 100:.0f}%)"
+            )
+    return result
 
 
 def enrich_records(records_df: pd.DataFrame) -> pd.DataFrame:
@@ -153,9 +183,10 @@ def enrich_records(records_df: pd.DataFrame) -> pd.DataFrame:
     # Smooth altitude (30-record rolling mean filters GPS noise)
     df["alt_smooth"] = df["enhanced_altitude"].rolling(window=30, center=True, min_periods=1).mean()
 
-    # Time deltas (seconds)
+    # Time deltas (seconds) and elapsed time since start
     df["timestamp_dt"] = pd.to_datetime(df["timestamp"])
     df["dt"] = df["timestamp_dt"].diff().dt.total_seconds().fillna(0)
+    df["elapsed_s"] = (df["timestamp_dt"] - df["timestamp_dt"].iloc[0]).dt.total_seconds()
 
     # Distance deltas
     if "distance" in df.columns:
@@ -178,6 +209,85 @@ def enrich_records(records_df: pd.DataFrame) -> pd.DataFrame:
     df["gap_speed"] = df["enhanced_speed"] * cost_factors
 
     return df
+
+
+def _time_base(records_df: pd.DataFrame) -> pd.DataFrame:
+    """Enriched records, with time columns even when altitude/speed are missing."""
+    df = enrich_records(records_df)
+    if "elapsed_s" not in df.columns and "timestamp" in df.columns and len(df):
+        df = df.copy()
+        df["timestamp_dt"] = pd.to_datetime(df["timestamp"])
+        df["dt"] = df["timestamp_dt"].diff().dt.total_seconds().fillna(0)
+        df["elapsed_s"] = (df["timestamp_dt"] - df["timestamp_dt"].iloc[0]).dt.total_seconds()
+    return df
+
+
+def window_stats(enriched_df: pd.DataFrame, start_s: float, end_s: float) -> dict | None:
+    """Metrics over an elapsed-time window of records.
+
+    Shared math for fitness-test and effort extraction: mean HR, raw and
+    grade-adjusted pace, net elevation, HR slope (last vs first 5 min) and
+    continuity (longest pause, moving share). Expects a `_time_base` frame;
+    returns None when the window holds no records.
+    """
+    if "elapsed_s" not in enriched_df.columns:
+        return None
+    win = enriched_df[(enriched_df["elapsed_s"] >= start_s) & (enriched_df["elapsed_s"] <= end_s)]
+    if win.empty:
+        return None
+
+    hr = win["heart_rate"].dropna() if "heart_rate" in win.columns else pd.Series(dtype=float)
+
+    hr_slope = hr_range = None
+    if len(hr):
+        seg = min(300.0, (end_s - start_s) / 2)
+        first = win.loc[win["elapsed_s"] < start_s + seg, "heart_rate"].dropna()
+        last = win.loc[win["elapsed_s"] >= end_s - seg, "heart_rate"].dropna()
+        if len(first) and len(last):
+            hr_slope = round(float(last.mean() - first.mean()), 1)
+        # spread of minute-by-minute means: catches a ramp-then-fade window
+        # whose endpoints happen to match
+        minute_means = win.groupby((win["elapsed_s"] - start_s) // 60)["heart_rate"].mean().dropna()
+        if len(minute_means) >= 2:
+            hr_range = round(float(minute_means.max() - minute_means.min()), 1)
+
+    pace_raw = pace_gap = moving_share = None
+    moving = win
+    if "enhanced_speed" in win.columns:
+        moving = win[win["enhanced_speed"] > 0.5]
+        v = moving["enhanced_speed"].dropna()
+        if len(v) and v.mean() > 0:
+            pace_raw = round(1000 / v.mean())
+        if "gap_speed" in moving.columns:
+            g = moving["gap_speed"].dropna()
+            if len(g) and g.mean() > 0:
+                pace_gap = round(1000 / g.mean())
+
+    net_elev = None
+    if "alt_smooth" in win.columns:
+        alt = win["alt_smooth"].dropna()
+        if len(alt) >= 2:
+            net_elev = round(float(alt.iloc[-1] - alt.iloc[0]))
+
+    max_pause = None
+    if "dt" in win.columns and len(win):
+        max_pause = round(float(win["dt"].max()))
+        total_dt = float(win["dt"].sum())
+        if total_dt > 0 and "enhanced_speed" in win.columns:
+            moving_share = round(float(moving["dt"].sum()) / total_dt, 2)
+
+    return {
+        "window_start_s": round(start_s),
+        "window_end_s": round(end_s),
+        "avg_hr": round(float(hr.mean())) if len(hr) else None,
+        "pace_raw_s_per_km": pace_raw,
+        "pace_gap_s_per_km": pace_gap,
+        "net_elevation_m": net_elev,
+        "hr_slope_bpm": hr_slope,
+        "hr_range_bpm": hr_range,
+        "max_pause_s": max_pause,
+        "moving_share": moving_share,
+    }
 
 
 GRADIENT_BINS = [
@@ -238,37 +348,142 @@ def compute_gradient_profile(enriched_df: pd.DataFrame) -> list[dict]:
 FRIEL_LTHR_PCT = [0.85, 0.90, 0.95, 1.03]
 
 
-def estimate_threshold(records_df: pd.DataFrame, window_s: int = 1200) -> dict | None:
-    """LTHR + threshold pace from the hardest continuous `window_s` window.
+def estimate_threshold(records_df: pd.DataFrame, window_s: int = 1200,
+                       window: tuple[float, float] | None = None) -> dict | None:
+    """LTHR + threshold pace from a ~20-min sustained effort window.
 
     Field-test method (Friel/Coggan 20-min TT): threshold HR is the mean HR of
     a maximal ~20-min sustained effort, and threshold pace is the grade-adjusted
     pace (GAP) over that same window — so it stays valid on rolling terrain,
-    unlike Coros's flat-only test. Taking the highest-mean-HR window makes it
-    robust to where the warm-up / cool-down sit in the file. Returns None if
-    there is no HR or the file is shorter than the window.
+    unlike Coros's flat-only test. By default the window is the highest-mean-HR
+    continuous `window_s` stretch; pass ``window=(start_s, end_s)`` (elapsed
+    seconds) to override when the auto pick lands wrong. Steady-state quality
+    warnings (HR ramp, net elevation) make a bad window visible instead of
+    silently wrong. Returns None if there is no usable HR window.
     """
     if "heart_rate" not in records_df.columns or "timestamp" not in records_df.columns:
         return None
-    df = enrich_records(records_df)
-    if "timestamp_dt" not in df.columns:
-        df = df.assign(timestamp_dt=pd.to_datetime(df["timestamp"]))
-    df = df.dropna(subset=["heart_rate"]).set_index("timestamp_dt").sort_index()
-    if df.empty or (df.index[-1] - df.index[0]).total_seconds() < window_s:
+    df = _time_base(records_df)
+    if "elapsed_s" not in df.columns or df.empty:
         return None
 
-    hr_roll = df["heart_rate"].rolling(f"{window_s}s").mean()
-    end = hr_roll.idxmax()
-    lthr = round(float(hr_roll.loc[end]))
+    if window is not None:
+        start_s, end_s = window
+    else:
+        t0 = df["timestamp_dt"].iloc[0]
+        hrdf = df.dropna(subset=["heart_rate"]).set_index("timestamp_dt").sort_index()
+        if hrdf.empty or (hrdf.index[-1] - hrdf.index[0]).total_seconds() < window_s:
+            return None
+        hr_roll = hrdf["heart_rate"].rolling(f"{window_s}s").mean()
+        end_s = (hr_roll.idxmax() - t0).total_seconds()
+        start_s = max(0.0, end_s - window_s)
 
-    thr_pace_s = None
-    win = df.loc[end - pd.Timedelta(seconds=window_s):end]
-    if "gap_speed" in win.columns:
-        gap = win.loc[win["enhanced_speed"] > 0.5, "gap_speed"].dropna()
-        if len(gap) and gap.mean() > 0:
-            thr_pace_s = round(1000 / gap.mean())
+    stats = window_stats(df, start_s, end_s)
+    if not stats or stats["avg_hr"] is None:
+        return None
 
-    return {"lthr": lthr, "threshold_pace_s_per_km": thr_pace_s, "window_min": window_s // 60}
+    warnings = []
+    slope = stats["hr_slope_bpm"]
+    if slope is not None and slope > 5:
+        warnings.append(
+            f"HR still rising at end of window ({slope:+.0f} bpm): "
+            f"ramp effort, LTHR likely overestimated"
+        )
+    net = stats["net_elevation_m"]
+    if net is not None and abs(net) > 10:
+        updown, bias = ("downhill", "flattered") if net < 0 else ("uphill", "penalized")
+        warnings.append(f"window is net {updown} ({net:+d} m): raw pace {bias}")
+
+    return {
+        "lthr": stats["avg_hr"],
+        # backward compat: threshold_pace_s_per_km stays the grade-adjusted value
+        "threshold_pace_s_per_km": stats["pace_gap_s_per_km"],
+        "threshold_pace_raw_s_per_km": stats["pace_raw_s_per_km"],
+        "threshold_pace_gap_s_per_km": stats["pace_gap_s_per_km"],
+        "window_min": round((end_s - start_s) / 60),
+        "window_start_s": stats["window_start_s"],
+        "window_end_s": stats["window_end_s"],
+        "window_net_elevation_m": net,
+        "hr_slope_bpm": slope,
+        "warnings": warnings,
+    }
+
+
+def find_sustained_efforts(records_df: pd.DataFrame, window_minutes: tuple[int, ...] = (20,),
+                           top: int = 3) -> list[dict]:
+    """Best sustained efforts per window length, ranked by mean HR.
+
+    Opportunistic LTHR/threshold calibration from real outings and races: the
+    fitness-test window math (window_stats), minus the zone/VO2max wrapping.
+    Each candidate carries a ``steady`` verdict (small HR slope, no pause
+    > 30 s, continuous movement); non-steady candidates are kept but flagged.
+    """
+    if "heart_rate" not in records_df.columns or "timestamp" not in records_df.columns:
+        return []
+    df = _time_base(records_df)
+    if "elapsed_s" not in df.columns or df.empty:
+        return []
+    t0 = df["timestamp_dt"].iloc[0]
+    hrdf = df.dropna(subset=["heart_rate"]).set_index("timestamp_dt").sort_index()
+    if hrdf.empty:
+        return []
+
+    out = []
+    for wmin in window_minutes:
+        w_s = wmin * 60
+        hr_roll = hrdf["heart_rate"].rolling(f"{w_s}s").mean()
+        end_elapsed = (hr_roll.index - t0).total_seconds()
+        chosen: list[tuple[float, float]] = []
+        for i in np.argsort(-hr_roll.values):
+            e = end_elapsed[i]
+            s = e - w_s
+            if s < 0:
+                continue
+            if any(e > c_start and s < c_end for c_start, c_end in chosen):
+                continue
+            chosen.append((s, e))
+            if len(chosen) >= top:
+                break
+        for s, e in chosen:
+            stats = window_stats(df, s, e)
+            if not stats:
+                continue
+            steady = bool(
+                stats["hr_slope_bpm"] is not None and abs(stats["hr_slope_bpm"]) < 5
+                # ponytail: 15 bpm calibrated on real files — race climbs sit
+                # at 11-13, a misplaced ramp+fade window at 16+
+                and (stats["hr_range_bpm"] is None or stats["hr_range_bpm"] < 15)
+                and (stats["max_pause_s"] or 0) <= 30
+                and (stats["moving_share"] is None or stats["moving_share"] >= 0.85)
+            )
+            out.append({"window_min": wmin, **stats, "steady": steady})
+    return out
+
+
+def despike_max_hr(records_df: pd.DataFrame) -> int | None:
+    """Max HR excluding sensor-glitch episodes.
+
+    A glitch starts with an implausible jump (> 5 bpm/s — real HR rises
+    ~2-3 bpm/s at most) and falls back near the pre-jump baseline within a
+    minute; a real max effort keeps HR elevated much longer. Samples inside
+    such episodes are excluded from the clean max.
+    """
+    if "heart_rate" not in records_df.columns:
+        return None
+    hr = records_df["heart_rate"].dropna().to_numpy(dtype=float)
+    if len(hr) == 0:
+        return None
+
+    # ponytail: assumes ~1 Hz sampling (true for Coros/Garmin records)
+    ok = np.ones(len(hr), dtype=bool)
+    jumps = np.flatnonzero(np.diff(hr) > 5) + 1
+    for i in jumps:
+        baseline = hr[i - 1]
+        horizon = min(len(hr), i + 60)
+        back = np.flatnonzero(hr[i:horizon] <= baseline + 5)
+        if len(back):  # reverted within a minute → glitch episode
+            ok[i:i + back[0]] = False
+    return round(float(hr[ok].max())) if ok.any() else round(float(hr.max()))
 
 
 def estimate_vo2max(hr_max: float | None, hr_rest: float | None) -> float | None:
@@ -289,8 +504,12 @@ def zones_from_lthr(lthr: int) -> list[dict]:
     ]
 
 
-def analyze_fitness_test(fit_data: dict, filename: str, hr_rest: float | None = None) -> dict:
-    """Estimate threshold, HR zones and VO2max from a field-test FIT (open formulas)."""
+def analyze_fitness_test(fit_data: dict, filename: str, hr_rest: float | None = None,
+                         window: tuple[float, float] | None = None) -> dict:
+    """Estimate threshold, HR zones and VO2max from a field-test FIT (open formulas).
+
+    ``window=(start_s, end_s)`` overrides the auto-picked best-20-min window.
+    """
     records_df = pd.DataFrame(fit_data["records"])
     hr = records_df["heart_rate"].dropna() if "heart_rate" in records_df.columns else pd.Series(dtype=float)
     max_hr = int(hr.max()) if len(hr) else None
@@ -300,7 +519,7 @@ def analyze_fitness_test(fit_data: dict, filename: str, hr_rest: float | None = 
         "hr_rest": hr_rest,
         "vo2max": estimate_vo2max(max_hr, hr_rest),
     }
-    thr = estimate_threshold(records_df)
+    thr = estimate_threshold(records_df, window=window)
     if thr:
         result.update(thr)
         result["zones"] = zones_from_lthr(thr["lthr"])
@@ -314,6 +533,10 @@ def analyze_activity(fit_data: dict, filename: str) -> dict | None:
 
     session = fit_data["sessions"][0]
     records_df = pd.DataFrame(fit_data["records"])
+
+    sport = session.get("sport")
+    sub_sport = session.get("sub_sport")
+    is_run = sport in (None, "running")
 
     total_distance = session.get("total_distance", 0) or 0
     total_time = session.get("total_timer_time", 0) or 0
@@ -343,9 +566,6 @@ def analyze_activity(fit_data: dict, filename: str) -> dict | None:
     if "heart_rate" in records_df.columns:
         hr_zones = compute_hr_zones(records_df["heart_rate"])
 
-    # Cardiac drift
-    cardiac_drift = compute_cardiac_drift(records_df)
-
     # GAP (Grade-Adjusted Pace)
     enriched = enrich_records(records_df)
     avg_gap_speed = None
@@ -353,6 +573,29 @@ def analyze_activity(fit_data: dict, filename: str) -> dict | None:
         valid_gap = enriched.loc[enriched["enhanced_speed"] > 0.5, "gap_speed"]
         if len(valid_gap) > 0:
             avg_gap_speed = float(valid_gap.mean())
+
+    # Cardiac drift (with terrain-confound check from the enriched columns)
+    cardiac_drift = compute_cardiac_drift(enriched)
+
+    # Max HR sanity: isolated sensor spikes and values beyond the configured
+    # physiological max are flagged, never silently replaced
+    max_hr_clean = despike_max_hr(records_df)
+    max_hr_suspect = bool(max_hr) and (
+        (max_hr_clean is not None and max_hr > max_hr_clean + 3)
+        or (bool(HR_MAX) and max_hr > HR_MAX + 3)
+    )
+
+    # Cadence on flat running segments only (poles on climbs corrupt wrist
+    # cadence; > 2 m/s excludes walking/technical bits)
+    cadence_flat = None
+    if is_run and {"cadence", "gradient", "enhanced_speed"}.issubset(enriched.columns):
+        flat = enriched[(enriched["gradient"].abs() < 0.05) & (enriched["enhanced_speed"] > 2.0)]
+        cad = flat["cadence"].dropna()
+        cad = cad[cad > 0]
+        if len(cad) >= 60:
+            cadence_flat = round(float(cad.mean()))
+            if cadence_flat < 100:  # Coros stores cadence as half-cycles
+                cadence_flat *= 2
 
     # Uphill time and ascent rate
     uphill_time_s = compute_uphill_time(records_df)
@@ -386,10 +629,12 @@ def analyze_activity(fit_data: dict, filename: str) -> dict | None:
             "descent_m": lap.get("total_descent", 0) or 0,
         })
 
-    return {
+    result = {
         "filename": filename,
         "date": date_str,
         "date_int": date_int,
+        "sport": sport,
+        "sub_sport": sub_sport,
         "distance_km": round(distance_km, 2),
         "duration": format_duration(total_time),
         "duration_s": total_time,
@@ -400,15 +645,38 @@ def analyze_activity(fit_data: dict, filename: str) -> dict | None:
         "avg_gap_speed_ms": round(avg_gap_speed, 2) if avg_gap_speed else None,
         "avg_hr": avg_hr,
         "max_hr": max_hr,
+        "max_hr_clean": max_hr_clean,
+        "max_hr_suspect": max_hr_suspect,
         "avg_cadence": avg_cadence,
+        "cadence_flat": cadence_flat,
         "elevation": elevation,
         "hr_zones": hr_zones,
-        "cardiac_drift_pct": cardiac_drift,
+        "cardiac_drift_pct": cardiac_drift["pct"] if cardiac_drift else None,
+        "cardiac_drift_confounded": cardiac_drift["confounded"] if cardiac_drift else None,
+        "cardiac_drift_note": cardiac_drift["note"] if cardiac_drift else None,
         "ascent_rate_m_h": ascent_rate,
         "vertical_ratio_m_km": vertical_ratio,
         "km_effort": km_effort,
         "laps": laps,
     }
+
+    if not is_run:
+        # run-only metrics are meaningless on a bike (coasting, no step cadence,
+        # GAP model is a running cost model)
+        result.update({
+            "avg_pace": None,
+            "avg_gap": None,
+            "avg_gap_speed_ms": None,
+            "avg_cadence": None,
+            "cadence_flat": None,
+            "cardiac_drift_pct": None,
+            "cardiac_drift_confounded": None,
+            "cardiac_drift_note": None,
+            "vertical_ratio_m_km": None,
+            "km_effort": None,
+        })
+
+    return result
 
 
 def compute_week_summary(activities: list[dict]) -> dict:
@@ -421,6 +689,20 @@ def compute_week_summary(activities: list[dict]) -> dict:
     total_time_s = sum(a["duration_s"] for a in activities)
     avg_hr = sum(a["avg_hr"] for a in activities) / len(activities)
 
+    # Per-sport split so bike time/D+ is never silently mixed into run totals
+    by_sport: dict[str, dict] = {}
+    for a in activities:
+        sport = a.get("sport") or "running"
+        key = {"running": "run", "cycling": "ride"}.get(sport, sport)
+        g = by_sport.setdefault(key, {"sessions": 0, "total_km": 0.0, "total_dplus": 0, "_time_s": 0.0})
+        g["sessions"] += 1
+        g["total_km"] += a["distance_km"]
+        g["total_dplus"] += a["ascent_m"]
+        g["_time_s"] += a["duration_s"]
+    for g in by_sport.values():
+        g["total_km"] = round(g["total_km"], 1)
+        g["total_time_h"] = round(g.pop("_time_s") / 3600, 2)
+
     return {
         "runs": len(activities),
         "total_km": round(total_km, 1),
@@ -431,24 +713,56 @@ def compute_week_summary(activities: list[dict]) -> dict:
         "avg_hr": round(avg_hr),
         "vertical_ratio": round(total_dplus / total_km) if total_km > 0 else 0,
         "km_effort": round(total_km + total_dplus / 100, 1),
+        "by_sport": by_sport,
     }
 
 
 if __name__ == "__main__":
-    # self-check for the open-formula estimators
+    # self-check for the open-formula estimators and window helpers
     assert estimate_vo2max(187, 47) == 60.9, estimate_vo2max(187, 47)
     z = zones_from_lthr(175)
     assert [x["max"] for x in z[:4]] == [149, 158, 166, 180], z
     assert z[0]["min"] == 0 and z[-1]["max"] == 999, z
-    # synthetic 25-min ramp on flat terrain: LTHR = last-20-min mean, pace = 3 m/s
-    n = 25 * 60
+
+    # synthetic 40-min flat file @3 m/s: 10-min warm-up, 20-min steady @175, 10-min cool-down
+    n = 40 * 60
     _df = pd.DataFrame({
         "timestamp": pd.date_range("2026-01-01", periods=n, freq="s"),
-        "heart_rate": np.linspace(150, 180, n),
+        "heart_rate": np.concatenate([np.full(600, 130.0), np.full(1200, 175.0), np.full(600, 120.0)]),
         "enhanced_altitude": np.zeros(n),
         "enhanced_speed": np.full(n, 3.0),
     })
     thr = estimate_threshold(_df)
-    assert thr and 165 <= thr["lthr"] <= 178, thr
+    assert thr and 170 <= thr["lthr"] <= 175, thr
     assert thr["threshold_pace_s_per_km"] == round(1000 / 3.0), thr
-    print("fit_parser self-check OK:", estimate_vo2max(187, 47), thr)
+    assert thr["warnings"] == [], thr
+
+    # explicit window targets the steady block exactly
+    thr2 = estimate_threshold(_df, window=(600, 1800))
+    assert thr2["lthr"] == 175 and thr2["window_start_s"] == 600, thr2
+
+    # ramp effort → warning fires
+    thr3 = estimate_threshold(_df.assign(heart_rate=np.linspace(140, 190, n)))
+    assert any("ramp" in w for w in thr3["warnings"]), thr3
+
+    # effort finder lands on the steady block and calls it steady
+    eff = find_sustained_efforts(_df, (20,), top=1)
+    assert eff and abs(eff[0]["window_start_s"] - 600) <= 30 and eff[0]["steady"], eff
+
+    # isolated HR spike is despiked
+    _sp = pd.Series(np.full(600, 150.0))
+    _sp.iloc[300] = 205.0
+    assert despike_max_hr(pd.DataFrame({"heart_rate": _sp})) == 150
+
+    # drift confounded on a climb-then-descend profile with a large drift,
+    # not on flat, and not when the drift is too small to interpret
+    alt = np.concatenate([np.linspace(0, 300, n // 2), np.linspace(300, 0, n - n // 2)])
+    hr2 = np.concatenate([np.full(n // 2, 130.0), np.full(n - n // 2, 160.0)])
+    d = compute_cardiac_drift(enrich_records(_df.assign(enhanced_altitude=alt, heart_rate=hr2)))
+    assert d["confounded"] and d["pct"] > 20, d
+    d_flat = compute_cardiac_drift(enrich_records(_df))
+    assert not d_flat["confounded"], d_flat
+    d_small = compute_cardiac_drift(enrich_records(_df.assign(enhanced_altitude=alt, heart_rate=150.0)))
+    assert d_small["pct"] == 0 and not d_small["confounded"], d_small
+
+    print("fit_parser self-check OK")

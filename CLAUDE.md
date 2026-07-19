@@ -27,7 +27,8 @@ All analysis commands support `--json` for structured AI-readable output.
 | `vs list [--json]` | List available FIT files |
 | `vs analyze <date> [--json]` | Analyze a single activity (date YYYYMMDD or file path) |
 | `vs profile <date> [--json]` | Pace + HR profile by gradient bucket for one activity |
-| `vs fitness-test <date> [--json]` | Estimate LTHR, threshold pace, HR zones, VO2max from a field-test FIT (open formulas: Friel 20-min TT + Uth-Sørensen; independent of Coros) |
+| `vs fitness-test <date> [--from MM:SS --to MM:SS] [--json]` | Estimate LTHR, threshold pace (raw + GAP), HR zones, VO2max from a field-test FIT (open formulas: Friel 20-min TT + Uth-Sørensen; independent of Coros). `--from/--to` pin the effort window; steady-state warnings flag ramp/downhill windows |
+| `vs effort <date> [--window N ...] [--json]` | Best sustained steady efforts inside any activity (top 3 per window length, ranked by avg HR) — opportunistic LTHR/threshold calibration from real outings and races |
 | `vs week --start X --end Y [--json]` | Weekly analysis with summary + plan comparison |
 | `vs assess [--start X --end Y] [--json]` | Strengths/weaknesses assessment |
 | `vs plan [--week N] [--json]` | Training plan targets (read from `coach/plan/*.md`) |

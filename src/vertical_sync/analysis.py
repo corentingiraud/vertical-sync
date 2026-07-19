@@ -7,6 +7,16 @@ def assess_activity(metrics: dict) -> list[dict]:
     """Assess a single activity. Returns list of observations."""
     obs = []
 
+    # --- Non-running sports: run zones/cadence/climb criteria don't transfer ---
+    sport = metrics.get("sport") or "running"
+    if sport != "running":
+        return [{
+            "type": "info",
+            "category": "sport",
+            "detail": f"Activite {sport} — metriques et zones course a pied non applicables",
+            "implication": "Analyse limitee au volume (temps, D+, FC brute)",
+        }]
+
     # --- HR zone discipline ---
     zones = metrics.get("hr_zones", {})
     if zones:
@@ -52,7 +62,14 @@ def assess_activity(metrics: dict) -> list[dict]:
     # --- Cardiac drift ---
     drift = metrics.get("cardiac_drift_pct")
     if drift is not None:
-        if abs(drift) < 3:
+        if metrics.get("cardiac_drift_confounded"):
+            obs.append({
+                "type": "info",
+                "category": "aerobic_fitness",
+                "detail": f"Derive cardiaque {drift:+.1f}% non interpretable — {metrics.get('cardiac_drift_note')}",
+                "implication": "Le chiffre reflete le profil du parcours, pas la fatigue/hydratation",
+            })
+        elif abs(drift) < 3:
             obs.append({
                 "type": "strength",
                 "category": "aerobic_fitness",
@@ -93,21 +110,22 @@ def assess_activity(metrics: dict) -> list[dict]:
                 "implication": "Travailler la marche active en montee (>20% pente), viser >500m/h",
             })
 
-    # --- Cadence ---
-    cadence = metrics.get("avg_cadence", 0)
-    if cadence and cadence > 0:
+    # --- Cadence (flat segments when available: poles on climbs corrupt it) ---
+    cadence = metrics.get("cadence_flat") or metrics.get("avg_cadence") or 0
+    flat_note = " sur le plat" if metrics.get("cadence_flat") else ""
+    if cadence > 0:
         if 170 <= cadence <= 185:
             obs.append({
                 "type": "strength",
                 "category": "technique",
-                "detail": f"Cadence optimale ({cadence} spm)",
+                "detail": f"Cadence optimale ({cadence} spm{flat_note})",
                 "implication": "Bonne frequence de pas, efficacite biomecanique",
             })
         elif cadence < 155:
             obs.append({
                 "type": "weakness",
                 "category": "technique",
-                "detail": f"Cadence basse ({cadence} spm)",
+                "detail": f"Cadence basse ({cadence} spm{flat_note})",
                 "implication": "Viser 170+ spm pour reduire l'impact et ameliorer l'efficacite en trail",
             })
 
@@ -209,10 +227,12 @@ def assess_week(week_summary: dict, activities: list[dict], start_date: int) -> 
                 "implication": "Bonne regularite d'entrainement",
             })
 
-    # --- Overall intensity polarization ---
+    # --- Overall intensity polarization (runs only: bike HR sits below run zones) ---
     all_z12 = []
     all_z45 = []
     for a in activities:
+        if (a.get("sport") or "running") != "running":
+            continue
         zones = a.get("hr_zones", {})
         if zones:
             z12 = zones.get("Z1", {}).get("pct", 0) + zones.get("Z2", {}).get("pct", 0)
@@ -239,7 +259,11 @@ def assess_week(week_summary: dict, activities: list[dict], start_date: int) -> 
             })
 
     # --- Average cardiac drift across runs ---
-    drifts = [a["cardiac_drift_pct"] for a in activities if a.get("cardiac_drift_pct") is not None]
+    drifts = [
+        a["cardiac_drift_pct"]
+        for a in activities
+        if a.get("cardiac_drift_pct") is not None and not a.get("cardiac_drift_confounded")
+    ]
     if drifts:
         avg_drift = sum(drifts) / len(drifts)
         if avg_drift > 7:
